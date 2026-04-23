@@ -1,5 +1,51 @@
 """
-Full definition of a GPT Language Model, all of it in this single file.
+Full definition of a GPT Language Model.
+
+=============================================================================
+ARCHITECTURAL OVERVIEW (Execution Order)
+=============================================================================
+This model is a decoder-only Transformer autoregressive language model. 
+When a sequence of token indices is passed into the `forward` pass, it follows 
+these sequential steps:
+
+1.  EMBEDDING LAYER (`wte` & `wpe`): 
+    - Converts raw token integers into dense vectors (Token Embeddings).
+    - Adds learned positional vectors (Position Embeddings) so the model knows 
+      the order of the sequence.
+    - Applies Dropout for regularization.
+
+2.  TRANSFORMER BLOCKS (`h`): The embedded sequence passes through `n_layer` 
+    sequential blocks. Each block does the following:
+    
+    a) Layer Normalization 1: Applied *before* attention (Pre-Norm architecture) 
+       for training stability.
+    b) Causal Self-Attention: 
+       - Projects the input into Query, Key, and Value (QKV) vectors.
+       - Splits them into multiple "heads" to attend to different representation subspaces.
+       - Calculates attention scores (Q dot K).
+       - Applies a "Causal Mask" (lower triangular matrix) to prevent tokens from 
+         looking at future tokens.
+       - Multiplies scores by Values to get the context-aware vectors.
+       - Projects the concatenated heads back to the embedding dimension.
+    c) Residual Connection 1: Adds the original input to the attention output 
+       to prevent vanishing gradients.
+    d) Layer Normalization 2: Applied *before* the MLP.
+    e) Multilayer Perceptron (MLP): A feed-forward network that expands the 
+       dimensionality by 4x, applies a non-linear GELU activation, and projects 
+       it back down. This is where the model "thinks" about the gathered context.
+    f) Residual Connection 2: Adds the input to the MLP output.
+
+3.  FINAL LAYER NORMALIZATION (`ln_f`): Stabilizes the final hidden states 
+    before predicting the vocabulary.
+
+4.  LANGUAGE MODELING HEAD (`lm_head`): A linear layer that projects the final 
+    embedding dimension back up to the `vocab_size` to produce "logits" (raw, 
+    unnormalized scores for the next predicted token).
+
+5.  LOSS CALCULATION (If training): Compares the predicted logits to the actual 
+    target tokens using Cross-Entropy Loss.
+=============================================================================
+
 References:
 1) the official GPT-2 TensorFlow implementation released by OpenAI:
 https://github.com/openai/gpt-2/blob/master/src/model.py
@@ -9,7 +55,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass # for simple config class, makes it easy to add new hyperparameters and default values
 
 import torch
 import torch.nn as nn
@@ -31,58 +77,83 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0, "embedding dimension must be divisible by number of heads"
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias) # this is more efficient than doing 3 separate linear projections for query, key and value
-        # output projection
+        
+        # Fused QKV projection: projects input to Queries, Keys, and Values in a single matrix multiply 
+        # for better hardware utilization, rather than 3 separate linear layers.
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+
+        # Projects the concatenated attention heads back to the residual stream dimension
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
+
+        # Regularization to prevent overfitting on specific attention paths
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
+
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        # flash attention make GPU super fast but support is only in PyTorch >= 2.0
+
+        # Flash Attention is a highly optimized, memory-efficient exact attention algorithm.
+        # However, it is only supported in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
+            # Causal mask (lower triangular matrix) ensures token `i` can only attend to tokens `<= i`
+            # We register it as a buffer so it is saved in the state_dict but not updated by gradients
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size)) 
             # .view() above reshapes the matrix to 4D, adding two leading dimensions of size 1. 
             # This allows the mask to broadcast against attention score tensors shaped (batch, heads, seq_len, seq_len) during training
 
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size() # Batch size, Sequence length (Time), Channels (n_embd)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        # 1. Project to Q, K, V, THEN split the fused tensor on the last dimension into three separate tensors for queries, keys, and values
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2) # dim=2 corresponds to the embedding dimension n_embd
+        
+        # 2. Reshape for Multi-Head: (B, T, C) -> (B, T, num_heads, head_size) -> (B, num_heads, T, head_size)
+        # Transposing brings the head dimension forward so batch matrix multiply (bmm) treats heads independently
+        # If we do not do that, the attention would be computed across the entire embedding dimension instead of separately for each head, 
+        # which would break the multi-head mechanism
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # 3. Calculate Attention
         if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
+            # Efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
-            # manual implementation of attention
+            # Manual attention formula: softmax(Q * K^T / sqrt(d_k)) * V
+            # Scaling by 1/sqrt(head_size) prevents the dot products from growing too large, 
+            # which would push softmax to extreme values and lead to vanishing gradients during training
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            # Apply the causal mask: replace upper triangular 0s with -inf so softmax evaluates them to 0% probability
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
+            # Aggregate values based on attention probabilities:
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        
+        # 4. Re-assemble: (B, num_heads, T, head_size) -> (B, T, num_heads, head_size) -> (B, T, C)
+        # .contiguous() ensures memory layout is strictly sequential before .view() flattens the heads back together
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        # output projection
+        # 5. Output projection and residual dropout
         y = self.resid_dropout(self.c_proj(y))
         return y
 
 class MLP(nn.Module):
-
+    """ Multilayer Perceptron: The 'feed-forward' part of the transformer block. """
     def __init__(self, config):
         super().__init__()
+        # Standard transformer practice: 
+        # expand the hidden dimension by 4x to create a wide representational space
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        # GELU (Gaussian Error Linear Unit) is smoother than ReLU and generally performs better in Transformers
         self.gelu    = nn.GELU()
+        # Project back down to the residual stream dimension
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -94,7 +165,7 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-
+    """ A single Transformer Block. """
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
@@ -103,14 +174,20 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
+        # "Pre-Norm" formulation: x = x + SubLayer(LayerNorm(x))
+        # Normalizing before the attention/MLP makes deep networks much easier to train 
+        # compared to the original "Post-Norm" paper formulation
+        # REFORMULATE
+        # because the gradients can more easily flow through the skip connections to earlier layers, 
+        # without being multiplied by the weights of the attention/MLP sublayers which could cause them to vanish or explode
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    block_size: int = 1024 # Maximum context length
+    vocab_size: int = 50304 # Padded from 50257. Multiples of 64 optimize matrix math on NVIDIA GPUs (Tensor Cores)
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -125,28 +202,33 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        # The core architecture components
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.n_embd), # Word Token Embeddings
+            wpe = nn.Embedding(config.block_size, config.n_embd), # Word Position Embeddings
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]), # Sequential hidden layers
+            ln_f = LayerNorm(config.n_embd, bias=config.bias), # Final layer norm
         ))
+
+        # The output head maps the final hidden state to vocabulary logits
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
+
+        # WEIGHT TYING: The embedding matrix and the final output projection matrix share the exact same weights
+        # Rationale: If two words have similar embeddings, they should also have similar output probabilities
+        # This drastically reduces the total parameter count (~30% of GPT-2 small)
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
-        # init all weights
+        # Initialize all weights
         self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
+
+        # Special initialization: Scale down the weights of residual projections (c_proj) at initialization
+        # Why? In deep networks with residual connections, variance accumulates over layers
+        # Scaling by 1/sqrt(2 * n_layer) keeps the variance of the residual stream bounded at init
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
-        # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
     def get_num_params(self, non_embedding=True):
@@ -162,6 +244,7 @@ class GPT(nn.Module):
         return n_params
 
     def _init_weights(self, module):
+        # Standard normal initialization centered at 0 with 0.02 std dev (GPT-2 standard)
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -176,28 +259,37 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
+        ### 1. EMBEDDING LAYER ###
+        # Add token and position vectors together so the model inherently understands sequence order
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+
+        ### 2. TRANSFORMER BLOCKS ###
+        # Pass through all transformer blocks sequentially
         for block in self.transformer.h:
             x = block(x)
+        
+        ### 3. FINAL LAYER NORM ###
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
+            # Training mode: calculate logits for all tokens and compute cross-entropy loss against targets
             logits = self.lm_head(x)
+            # Flatten to 2D for cross_entropy PyTorch implementation: (B*T, C) and (B*T)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            # Inference mode optimization: we only care about predicting the *next* token
+            # Therefore, we slice `x` to only pass the very last token's hidden state into `lm_head`.
+            # This saves massive amounts of unnecessary compute during generation
+            logits = self.lm_head(x[:, [-1], :]) # Note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
 
     def crop_block_size(self, block_size):
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
+        # Utility to slice down positional embeddings and causal masks if we want to run a pretrained
+        # model (e.g., 1024 context) at a smaller max context size to save VRAM
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
         self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
@@ -207,9 +299,10 @@ class GPT(nn.Module):
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
+        """ Loads weights from HuggingFace's pre-trained GPT-2 checkpoints into this custom architecture. """
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
-        # only dropout can be overridden see more notes below
+        # Only dropout can be overridden, see more notes below
         assert all(k == 'dropout' for k in override_args)
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
@@ -225,22 +318,24 @@ class GPT(nn.Module):
         config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
         config_args['bias'] = True # always True for GPT model checkpoints
-        # we can override the dropout rate, if desired
+        
+        # We can override the dropout rate, if desired
         if 'dropout' in override_args:
             print(f"overriding dropout rate to {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
-        # create a from-scratch initialized minGPT model
+
+        # Create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
-        # init a huggingface/transformers model
+        # Init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
 
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
+        # Copy while ensuring all of the parameters are aligned and match in names and shapes
         sd_keys_hf = sd_hf.keys()
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
@@ -263,14 +358,17 @@ class GPT(nn.Module):
         return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        """ Configures the AdamW optimizer with smart weight decay rules. """
+        # Start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+
+        # RULE: Only apply weight decay to 2D parameters (matrix multipliers and embeddings)
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        # We do NOT apply weight decay to 1D parameters (Biases and LayerNorm scales)
+        # Decaying those degrades performance by interfering with the network's ability to shift/scale distributions
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+
+        # Create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
@@ -279,6 +377,7 @@ class GPT(nn.Module):
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
@@ -289,44 +388,60 @@ class GPT(nn.Module):
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
+        """ 
+        Estimate Model FLOPs Utilization (MFU).
+        Measures how effectively the hardware (e.g. A100 GPU) is being utilized during training 
+        compared to its theoretical peak performance.
+        """
+        # First, we estimate the number of flops we do per iteration
         N = self.get_num_params()
         cfg = self.config
         L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
+        # FLOP estimation formula from the PaLM paper
+        # See PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         flops_per_token = 6*N + 12*L*H*Q*T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
+
+        # Express our flops throughput as ratio of A100 bfloat16 peak flops
+        flops_achieved = flops_per_iter * (1.0/dt) # Achieved FLOPs per second
+        flops_promised = 312e12 # Theoretical max of A100 GPU (bfloat16)
         mfu = flops_achieved / flops_promised
         return mfu
 
-    @torch.no_grad()
+    @torch.no_grad() # Disables gradient tracking during inference to save memory
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        Autoregressive generation loop.
+        Take a sequence of indices `idx` (LongTensor of shape (b,t)) 
+        and repeatedly predicts the next token, appending it to the input.
         """
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
+            # 1. Truncate context if it exceeds the maximum block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
+            
+            # 2. Forward pass to get logits. (Relies on the [-1] inference optimization in forward())
             logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
+
+            # 3. Temperature Scaling: 
+            # T=1.0 does nothing. T<1.0 sharpens the distribution (more confident/deterministic) 
+            # T>1.0 flattens the distribution (more random/creative)
             logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
+
+            # 4. Top-K Sampling: truncate the probability distribution to only the top `k` most likely tokens
+            # This prevents the model from sampling highly unlikely "tail" tokens
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                # Mask out everything below the k-th highest logit
                 logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
+
+            # 5. Apply Softmax to convert logits to probabilities
             probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
+
+            # 6. Sample a single token from the resulting distribution
             idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
+
+            # 7. Append the predicted token to the sequence and repeat
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
