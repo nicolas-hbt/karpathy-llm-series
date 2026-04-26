@@ -14,9 +14,18 @@ import unicodedata
 
 def get_stats(ids, counts=None):
     """
-    Given a list of integers, return a dictionary of counts of consecutive pairs
-    Example: [1, 2, 3, 1, 2] -> {(1, 2): 2, (2, 3): 1, (3, 1): 1}
-    Optionally allows to update an existing dictionary of counts
+    Count consecutive token pairs in an integer sequence.
+
+    Args:
+        ids: Sequence of token ids.
+        counts: Optional dictionary to update in-place, mapping
+            `(id_i, id_{i+1}) -> frequency`.
+
+    Returns:
+        A dictionary mapping consecutive id pairs to their counts.
+
+    Example:
+        [1, 2, 3, 1, 2] -> {(1, 2): 2, (2, 3): 1, (3, 1): 1}
     """
     counts = {} if counts is None else counts
     for pair in zip(ids, ids[1:]): # iterate consecutive elements
@@ -26,9 +35,19 @@ def get_stats(ids, counts=None):
 
 def merge(ids, pair, idx):
     """
-    In the list of integers (ids), replace all consecutive occurrences
-    of pair with the new integer token idx
-    Example: ids=[1, 2, 3, 1, 2], pair=(1, 2), idx=4 -> [4, 3, 4]
+    Replace every consecutive occurrence of a pair with a merged token id.
+
+    Args:
+        ids: Sequence of token ids.
+        pair: Consecutive id pair to merge, as `(left_id, right_id)`.
+        idx: Token id to emit when `pair` is found.
+
+    Returns:
+        A new list of token ids where each non-overlapping occurrence of
+        `pair` is replaced with `idx`.
+
+    Example:
+        ids=[1, 2, 3, 1, 2], pair=(1, 2), idx=4 -> [4, 3, 4]
     """
     newids = []
     i = 0
@@ -44,6 +63,15 @@ def merge(ids, pair, idx):
 
 # first two helper functions...
 def replace_control_characters(s: str) -> str:
+    """
+    Escape Unicode control characters in a string for readable display.
+
+    Args:
+        s: Input string that may contain control characters.
+
+    Returns:
+        A string where control characters are replaced by `\\uXXXX` escapes.
+    """
     # we don't want to print control characters
     # which distort the output (e.g. \n or much worse)
     # https://stackoverflow.com/questions/4324790/removing-control-characters-from-a-string-in-python/19016117#19016117
@@ -57,6 +85,16 @@ def replace_control_characters(s: str) -> str:
     return "".join(chars)
 
 def render_token(t: bytes) -> str:
+    """
+    Render a byte token as a printable string.
+
+    Args:
+        t: Raw token bytes.
+
+    Returns:
+        A UTF-8 decoded string (with replacement for invalid byte sequences)
+        where control characters are escaped.
+    """
     # pretty print a token, escaping control characters
     s = t.decode('utf-8', errors='replace')
     s = replace_control_characters(s)
@@ -66,9 +104,14 @@ def render_token(t: bytes) -> str:
 # the base Tokenizer class
 
 class Tokenizer:
-    """Base class for Tokenizers"""
+    """
+    Base class for tokenizers.
+
+    Subclasses are expected to implement training and text/id conversion.
+    """
 
     def __init__(self):
+        """Initialize tokenizer state with byte-level defaults."""
         # default: vocab size of 256 (all bytes), no merges, no patterns
         self.merges = {} # (int, int) -> int
         self.pattern = "" # str
@@ -76,18 +119,53 @@ class Tokenizer:
         self.vocab = self._build_vocab() # int -> bytes
 
     def train(self, text, vocab_size, verbose=False):
+        """
+        Train tokenizer merges from text.
+
+        Args:
+            text: Training corpus as a string.
+            vocab_size: Target vocabulary size after training.
+            verbose: If `True`, print training progress.
+
+        Raises:
+            NotImplementedError: Always, in the base class.
+        """
         # Tokenizer can train a vocabulary of size vocab_size from text
         raise NotImplementedError
 
     def encode(self, text):
+        """
+        Encode text into token ids.
+
+        Args:
+            text: Input string.
+
+        Raises:
+            NotImplementedError: Always, in the base class.
+        """
         # Tokenizer can encode a string into a list of integers
         raise NotImplementedError
 
     def decode(self, ids):
+        """
+        Decode token ids back into text.
+
+        Args:
+            ids: Sequence of token ids.
+
+        Raises:
+            NotImplementedError: Always, in the base class.
+        """
         # Tokenizer can decode a list of integers into a string
         raise NotImplementedError
 
     def _build_vocab(self):
+        """
+        Build the vocabulary mapping from byte tokens, merges, and specials.
+
+        Returns:
+            A dictionary mapping token id to token bytes.
+        """
         # vocab is simply and deterministically derived from merges
         vocab = {idx: bytes([idx]) for idx in range(256)}
         for (p0, p1), idx in self.merges.items():
@@ -98,10 +176,15 @@ class Tokenizer:
 
     def save(self, file_prefix):
         """
-        Saves two files: file_prefix.vocab and file_prefix.model
-        This is inspired (but not equivalent to!) sentencepiece's model saving:
-        - model file is the critical one, intended for load()
-        - vocab file is just a pretty printed version for human inspection only
+        Save tokenizer state to disk as model and vocab files.
+
+        Args:
+            file_prefix: Output prefix. Writes `{file_prefix}.model` and
+                `{file_prefix}.vocab`.
+
+        Notes:
+            The `.model` file is the source of truth for `load()`.
+            The `.vocab` file is for human inspection only.
         """
         # write the model: to be used in load() later
         model_file = file_prefix + ".model"
@@ -140,7 +223,16 @@ class Tokenizer:
                     f.write(f"[{s}] {idx}\n")
 
     def load(self, model_file):
-        """Inverse of save() but only for the model file"""
+        """
+        Load tokenizer state from a `.model` file.
+
+        Args:
+            model_file: Path to a file produced by `save()` with suffix
+                `.model`.
+
+        Notes:
+            This restores merges, special tokens, and the derived vocabulary.
+        """
         assert model_file.endswith(".model")
         # read the model file
         merges = {}
