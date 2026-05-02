@@ -107,7 +107,7 @@ class Tokenizer:
     """
     Base class for tokenizers.
 
-    Subclasses are expected to implement training and text/id conversion.
+    Subclasses are expected to implement training and text/id conversion, i.e. encode/decode.
     """
 
     def __init__(self):
