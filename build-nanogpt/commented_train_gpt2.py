@@ -8,25 +8,18 @@ import time
 import inspect
 # provides a clean way to define the configuration object with type hints and default values
 from dataclasses import dataclass
-# the core deep learning framework we are building upon
 import torch
-# provides the foundational neural network modules (linear layers, layernorms, etc.)
 import torch.nn as nn
-# contains stateless functions like softmax and cross_entropy that don't hold learnable parameters
-from torch.nn import functional as F
-# imports helper functions to parse and evaluate our model on the hellaswag dataset for common sense reasoning
 from hellaswag import render_example, iterate_examples
 
 # -----------------------------------------------------------------------------
 
-# implements the multi-head masked self-attention mechanism, the core routing operation of the transformer
+# implements the multi-head masked self-attention mechanism
 class CausalSelfAttention(nn.Module):
 
-    # initializes the attention module using the global hyperparameters defined in the config
     def __init__(self, config):
         # properly initializes the parent nn.Module class to register parameters
         super().__init__()
-        # ensures the embedding dimension can be evenly divided among the attention heads so each head gets an equal chunk
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
         # better than doing three separate linear layers, we can do one for all of them and then split the result
@@ -40,14 +33,11 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         # a special flag to scale down the initialization of residual layers to prevent early training instability
         self.c_proj.NANOGPT_SCALE_INIT = 1
-        # store the number of heads locally so the forward pass can reshape the tensors correctly
         self.n_head = config.n_head
-        # store the embedding dimension locally for the same reshaping reasons
         self.n_embd = config.n_embd
 
     # the forward pass computing the attention mechanism
     def forward(self, x):
-        # extract the dimensions from the input tensor to dynamically reshape query, key, and values later
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
@@ -73,9 +63,7 @@ class CausalSelfAttention(nn.Module):
 # implements the feedforward network that processes the tokens individually after they've communicated via attention
 class MLP(nn.Module):
 
-    # initialize the linear layers and activation functions
     def __init__(self, config):
-        # register this as a proper module
         super().__init__()
         # expands the dimensionality by 4x to allow the network space to memorize facts and learn rich representations
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
@@ -90,7 +78,7 @@ class MLP(nn.Module):
     def forward(self, x):
         # project into the higher dimensional space
         x = self.c_fc(x)
-        # apply the non-linearity to introduce complex mathematical functions into the model
+        # apply the non-linearity
         x = self.gelu(x)
         # project back down to combine the learned features into the residual stream
         x = self.c_proj(x)
@@ -100,9 +88,7 @@ class MLP(nn.Module):
 # a single transformer block consisting of attention and mlp, representing one "layer" of depth
 class Block(nn.Module):
 
-    # setup the normalization, attention, and feedforward sub-components
     def __init__(self, config):
-        # register module
         super().__init__()
         # applies layer normalization before the attention mechanism (pre-norm formulation) to stabilize gradients
         self.ln_1 = nn.LayerNorm(config.n_embd)
@@ -139,11 +125,8 @@ class GPTConfig:
 # the top-level GPT model wrapping the token embeddings, positional embeddings, and transformer blocks
 class GPT(nn.Module):
 
-    # initialize the entire architecture based on the provided configuration
     def __init__(self, config):
-        # register module
         super().__init__()
-        # save the config locally so we can reference architectural choices later
         self.config = config
 
         # groups the transformer components into a dictionary so PyTorch natively tracks their parameters
@@ -162,28 +145,30 @@ class GPT(nn.Module):
 
         # weight sharing scheme
         # ties the input embedding and output projection weights, dramatically saving parameters and ensuring syntactic alignment
+        # explanation in more details in my Google Docs
         self.transformer.wte.weight = self.lm_head.weight
 
-        # init params
-        # iterates over all modules and applies our custom weight initialization logic
+        # iterates over all modules and applies our custom weight initialization logic (defined below)
         self.apply(self._init_weights)
 
     # custom weight initialization function called recursively on all sub-modules
     def _init_weights(self, module):
-        # check if the module is a standard linear layer
+
         if isinstance(module, nn.Linear):
             # standard deviation for the normal distribution, matching typical transformer heuristics
             std = 0.02
             # check if this is a residual projection layer that we specifically flagged earlier
             if hasattr(module, 'NANOGPT_SCALE_INIT'):
                 # scale down the variance based on the depth of the network so early gradients don't explode
-                std *= (2 * self.config.n_layer) ** -0.5
+                # as we stack more and more layers, the variance of the activations grows, so we need to scale down the initialization even more aggressively to prevent the early layers from blowing up
+                # this means that the value for std gets smaller as we increase the number of layers
+                std *= (2 * self.config.n_layer) ** -0.5 # 20**-0.5 same thing as 1/sqrt(20) so we see that as self.config.n_layer increases, the std decreases
             # apply the calculated normal distribution to the weights
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             # strictly initialize biases to zero to prevent them from skewing the early network dynamics
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
-        # check if the module is an embedding layer
+
         elif isinstance(module, nn.Embedding):
             # initialize embedding weights with the standard normal distribution
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
