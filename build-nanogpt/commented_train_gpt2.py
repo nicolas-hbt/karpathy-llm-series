@@ -113,14 +113,12 @@ class Block(nn.Module):
 class GPTConfig:
     # defines the maximum context window the model can process at once
     block_size: int = 1024 # max sequence length
-    # defines the number of discrete tokens the model understands, plus special tokens
     vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     # defines the depth of the network
-    n_layer: int = 12 # number of layers
+    n_layer: int = 12 
     # defines the number of independent attention mechanisms per layer
-    n_head: int = 12 # number of heads
-    # defines the size of the residual stream (the main highway of information)
-    n_embd: int = 768 # embedding dimension
+    n_head: int = 12
+    n_embd: int = 768
 
 # the top-level GPT model wrapping the token embeddings, positional embeddings, and transformer blocks
 class GPT(nn.Module):
@@ -354,6 +352,8 @@ class DataLoaderLite:
     # initialize the loader with batch size, context length, and distributed cluster topology
     def __init__(self, B, T, process_rank, num_processes, split):
         # store micro batch size locally
+        # micro batch size conceptually represents the number of sequences processed independently by each GPU before synchronizing gradients, 
+        # and is a critical component of the overall training throughput and memory efficiency
         self.B = B
         # store sequence length locally
         self.T = T
@@ -372,6 +372,7 @@ class DataLoaderLite:
         # filter the files to only include those belonging to the requested split (e.g., 'train')
         shards = [s for s in shards if split in s]
         # sort the shards alphabetically so every GPU processes the dataset in the exact same order
+        # this guarantees that the file order is consistent across all processes, 
         shards = sorted(shards)
         # prepend the full directory path to the filenames so we can load them
         shards = [os.path.join(data_root, s) for s in shards]
@@ -394,6 +395,9 @@ class DataLoaderLite:
         # load the entire token array of the first shard into memory
         self.tokens = load_tokens(self.shards[self.current_shard])
         # calculate the initial starting index for this specific GPU based on its rank
+        # examples:
+        # if we have 4 GPUs, GPU number 3 will start at the index corresponding to 3 full GLOBAL batches (3 * B * T tokens) into the dataset, 
+        # ensuring that each GPU starts processing a different part of the data
         self.current_position = self.B * self.T * self.process_rank
 
     # fetches the next block of inputs and targets, then advances the pointers
@@ -657,7 +661,7 @@ for step in range(max_steps):
                 # accumulate the scalar loss value, disconnecting it from the computation graph with detach()
                 val_loss_accum += loss.detach()
         # synchronize the independent loss calculations across all the nodes in the cluster
-        if ddp:
+        if ddp: # if everything above was done independently on each GPU
             # mathematically average the loss tensor across all ranks
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         # only let the master node write to the disk and console to prevent overlapping outputs
@@ -673,15 +677,12 @@ for step in range(max_steps):
                 # optionally write model checkpoints
                 # construct the filename dynamically to include the step number padding
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-                # create a comprehensive dictionary of all necessary state
                 checkpoint = {
                     # grab the raw parameter tensors
                     'model': raw_model.state_dict(),
                     # grab the architecture definition
                     'config': raw_model.config,
-                    # record the exact step we are on
                     'step': step,
-                    # record the validation loss for comparison
                     'val_loss': val_loss_accum.item()
                 }
                 # you might also want to add optimizer.state_dict() and
@@ -768,9 +769,9 @@ for step in range(max_steps):
         xgen = tokens.to(device)
         # isolate the random generator state specifically for this sampling run
         sample_rng = torch.Generator(device=device)
-        # seed the generator uniquely per GPU so they don't generate the exact same text
+        # seed the generator uniquely **per GPU so they don't generate the exact same text**
         sample_rng.manual_seed(42 + ddp_rank)
-        # enter an autoregressive loop to generate tokens one by one
+        # enter an **autoregressive** loop to generate tokens one by one
         while xgen.size(1) < max_length:
             # forward the model to get the logits
             # strictly disable gradient tracking
@@ -782,24 +783,19 @@ for step in range(max_steps):
                 # take the logits at the last position
                 # we only care about the very last probability distribution to predict the next single token
                 logits = logits[:, -1, :] # (B, vocab_size)
-                # get the probabilities
                 # transform the raw, unbounded logits into mathematically valid probabilities (summing to 1)
                 probs = F.softmax(logits, dim=-1)
                 # do top-k sampling of 50 (huggingface pipeline default)
-                # aggressively truncate the distribution to only include the top 50 most likely candidates, destroying the long tail of noise
-                # topk_probs here becomes (5, 50), topk_indices is (5, 50)
                 topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
                 # select a token from the top-k probabilities
                 # note: multinomial does not demand the input to sum to 1
-                # roll the dice to randomly select a token index based on the remaining weights
                 ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
                 # gather the corresponding indices
                 # map the local top-50 index back to the global vocabulary ID
                 xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-                # append to the sequence
-                # concatenate the newly predicted token onto the running context
+                # append to the sequence: concatenate the newly predicted token onto the running context
                 xgen = torch.cat((xgen, xcol), dim=1)
-        # print the generated text
+
         # loop through the batch dimension to print each sample separately
         for i in range(num_return_sequences):
             # extract the raw list of integers
@@ -814,15 +810,13 @@ for step in range(max_steps):
     model.train()
     # completely wipe the gradient buffers from the previous global step so they don't erroneously compound
     optimizer.zero_grad()
-    # locally track the accumulated loss for logging purposes
     loss_accum = 0.0
     # iterate through all the micro-steps required to reach the global target batch size
     for micro_step in range(grad_accum_steps):
         # grab the next chunk of training data
         x, y = train_loader.next_batch()
-        # transfer the inputs and targets to the GPU
+        # to the GPU
         x, y = x.to(device), y.to(device)
-        # added after video, this field is also used by the forward pass.
         # if using distributed training, explicitly tell DDP whether or not to synchronize gradients over the network
         if ddp:
             # only trigger the massive network sync operation on the very last micro-step to save insane amounts of bandwidth
@@ -838,9 +832,9 @@ for step in range(max_steps):
         loss = loss / grad_accum_steps
         # locally accumulate the detached scalar loss for accurate console reporting later
         loss_accum += loss.detach()
-        # compute the backward pass, systematically populating the .grad attribute of every learnable tensor
+        # compute the backward pass, **systematically populating the .grad attribute of every learnable tensor**
         loss.backward()
-    # average the accumulated loss value across all the independent GPUs for reporting accuracy
+
     if ddp:
         # trigger the synchronization
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
@@ -861,19 +855,17 @@ for step in range(max_steps):
         torch.cuda.synchronize() # wait for the GPU to finish work
     # capture the end time
     t1 = time.time()
-    # calculate the time elapsed
-    dt = t1 - t0 # time difference in seconds
+    # time elapsed
+    dt = t1 - t0 
     # mathematically deduce exactly how many individual tokens the entire cluster just crunched
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     # divide total tokens by total time to get the global throughput speed
     tokens_per_sec = tokens_processed / dt
     # print the step summary from the main node
     if master_process:
-        # print formatting a very clean summary of loss, LR, gradient norm, and speeds
+        # summary of loss, LR, gradient norm, and speeds
         print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-        # open the central log file to persist the loss
         with open(log_file, "a") as f:
-            # write the unformatted raw values
             f.write(f"{step} train {loss_accum.item():.6f}\n")
 
 # conditionally teardown the distributed environment upon a clean exit
