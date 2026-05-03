@@ -178,7 +178,6 @@ class GPT(nn.Module):
         # idx is of shape (B, T)
         # extract the batch size and sequence length to generate the positional sequence
         B, T = idx.size()
-        # enforce the context length constraint so we don't index out of bounds on the positional embeddings
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
         # forward the token and position embeddings
         # create a sequence of integers from 0 to T-1 to represent the positions of the tokens
@@ -209,6 +208,12 @@ class GPT(nn.Module):
         return logits, loss
 
     # a utility classmethod to load OpenAI's official GPT-2 weights into our implementation
+    # classmethods are like static methods but they receive the class as the first argument instead of an instance, 
+    # allowing us to create and return an instance of the class after loading the weights
+    # in this case, a classmethod is useful because we want to return a fully initialized GPT model with the pretrained weights loaded, 
+    # and we don't have an instance of the model yet since we need to create it after we know the architecture from the model_type string
+    # in the code, we will call GPT.from_pretrained("gpt2") to get a GPT model with the 124M pretrained weights loaded, 
+    # and we can also call GPT.from_pretrained("gpt2-xl") to get a much larger model with the 1558M pretrained weights loaded
     @classmethod
     def from_pretrained(cls, model_type):
         """Loads pretrained GPT-2 model weights from huggingface"""
@@ -235,6 +240,7 @@ class GPT(nn.Module):
         # instantiate the dataclass with the resolved hyperparameters
         config = GPTConfig(**config_args)
         # build the blank model architecture
+        # we need to create the model first before we can load the weights because we need to know the exact parameter names and shapes to copy the weights into the correct locations
         model = GPT(config)
         # extract the underlying state dictionary (the raw parameter tensors) of our empty model
         sd = model.state_dict()
@@ -279,7 +285,7 @@ class GPT(nn.Module):
                 assert sd_hf[k].shape == sd[k].shape
                 # temporarily disable gradient tracking
                 with torch.no_grad():
-                    # explicitly copy the raw tensor data over
+                    # explicitly copy the raw tensor data over. No transposing
                     sd[k].copy_(sd_hf[k])
 
         # return the fully populated model
@@ -293,7 +299,7 @@ class GPT(nn.Module):
         # filter out any parameters that are frozen or don't require gradients
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't to prevent underfitting
+        # i.e. all weight tensors in matmuls + embeddings decay but not biases and layernorms to prevent underfitting
         # filter for multi-dimensional tensors (weights/embeddings) to apply the L2 penalty
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         # filter for 1D tensors (biases/layernorms) to exempt them from the L2 penalty
@@ -328,9 +334,8 @@ class GPT(nn.Module):
         return optimizer
 
 # -----------------------------------------------------------------------------
-# import the official OpenAI tokenizer library for extremely fast BPE tokenization
+# import the official OpenAI tokenizer library for fast BPE tokenization
 import tiktoken
-# import numpy for efficient multidimensional array loading from disk
 import numpy as np
 
 # utility function to load raw numpy token arrays and cast them to pytorch tensors
