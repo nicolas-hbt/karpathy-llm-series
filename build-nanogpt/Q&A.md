@@ -174,7 +174,7 @@ def from_pretrained(cls, model_type):
 """Loads pretrained GPT-2 model weights from huggingface"""
 ```
 
-## 1. The Magic of `@classmethod`
+### 1. The Magic of `@classmethod`
 The `@classmethod` decorator transforms a regular function into an **alternative constructor**. It allows the method to create and return a brand-new instance of the class *for* you, rather than requiring you to create an instance first.
 
 ### What happens WITH `@classmethod` (How it is now)
@@ -209,3 +209,83 @@ The only genuinely complex part of this code is the if any(k.endswith(w) for w i
 * The Solution: Whenever the loop encounters one of these specific layers, it simply calls .t() to transpose (flip) the matrix so it perfectly fits into your modern nn.Linear layer without breaking the math.
 
 ---
+
+## 6. In the reset() function, I need a concrete example to understand how GPUs are assigned to batches: if we consider the whole training dataset, do all GPUs see all the data (we simply rotate), or do GPUs each specialized in a fraction of the data (e.g. if 4 GPUs, the training data is split into 4 chunks, and for each of these chunks, each GPU sees only 25% of the data, with ofc using micro batches inside)? Illustrate with a concrete example, still everything in markdown format for easy copy pasting into my markdown file
+
+To answer your question directly: **Each GPU specializes in a strict fraction of the data.** If you have 4 GPUs, each GPU will only ever see exactly 25% of the data during a single epoch. They do not rotate or overlap. The *cluster as a whole* sees 100% of the dataset, but an individual GPU remains completely blind to the 75% being processed by its peers.
+
+Here is a concrete, step-by-step example to illustrate exactly how this math plays out using the `reset()` function and the subsequent jumps.
+
+### The Setup
+Let's imagine a vastly simplified scenario to make the math easy to track:
+* **Total Dataset:** 120 tokens (e.g., `[0, 1, 2, ..., 119]`)
+* **Micro Batch Size (`B`):** 2 sequences
+* **Context Length (`T`):** 5 tokens
+* **Total GPUs (`num_processes`):** 4
+* **Tokens per GPU per step (`B * T`):** 10 tokens
+
+### Step 1: Initialization (`reset()`)
+When the code calls `self.current_position = self.B * self.T * self.process_rank`, it is calculating the starting offset for each GPU. 
+
+Because `B * T = 10`, here is where each GPU points at the very beginning:
+* **GPU 0 (Rank 0):** `10 * 0 = 0`. It reads tokens **0 through 9**.
+* **GPU 1 (Rank 1):** `10 * 1 = 10`. It reads tokens **10 through 19**.
+* **GPU 2 (Rank 2):** `10 * 2 = 20`. It reads tokens **20 through 29**.
+* **GPU 3 (Rank 3):** `10 * 3 = 30`. It reads tokens **30 through 39**.
+
+At this exact moment, the 4 GPUs combined have collectively processed the first 40 tokens of the dataset (the "Global Batch").
+
+### Step 2: The Next Batch (The Stride)
+The `next_batch()` function contains this critical line to advance the pointer:
+`self.current_position += B * T * self.num_processes`
+
+In our example, this means every GPU jumps forward by `10 * 4 = 40` tokens. This is the **global stride**.
+
+Let's look at what happens on step 2:
+* **GPU 0** jumps from 0 to 40. It reads tokens **40 through 49**.
+* **GPU 1** jumps from 10 to 50. It reads tokens **50 through 59**.
+* **GPU 2** jumps from 20 to 60. It reads tokens **60 through 69**.
+* **GPU 3** jumps from 30 to 70. It reads tokens **70 through 79**.
+
+### Step 3: And so on...
+For step 3, everyone jumps by 40 again:
+* **GPU 0** reads **80-89**.
+* **GPU 1** reads **90-99**.
+* **GPU 2** reads **100-109**.
+* **GPU 3** reads **110-119**.
+
+### Why do it this way?
+If all 4 GPUs looked at the exact same data, they would calculate the exact same gradients. When they synchronized over the network, it would be entirely redundant—you would just be doing the same math 4 times!
+
+By strictly siloing the data into interleaved chunks, each GPU calculates a unique gradient based on its unique 25% of the data. During the backward pass, PyTorch takes those 4 distinct gradients, averages them together, and applies the *combined* knowledge to the model. This is how 4 GPUs process an epoch 4 times faster than a single GPU.
+
+## 7. Follow up: This illustrates only one epoch of training, right? If so, for the next epoch, are GPUs assigned the same data points as during the first epoch? Or do we rotate? Btw, would that make any difference?
+## Epochs, Data Rotation, and Shuffling in DDP
+
+The previous example indeed illustrates just **one epoch**. 
+
+### What happens in *this specific code*?
+In the `DataLoaderLite` class provided in your script, **the GPUs are assigned the exact same data points in the exact same order** for every subsequent epoch. 
+
+If we look at the `next_batch()` function, when the dataloader hits the end of a file (shard) and wraps around back to the beginning, it executes this line:
+`self.current_position = B * T * self.process_rank`
+
+Because there is no random seed or "epoch number" being factored into that calculation, GPU 0 will always start at offset `0`, GPU 1 will always start at offset `10`, and so on. They will endlessly trace the exact same tracks through the dataset.
+
+### Does it make a difference?
+The short answer is: **Yes, usually. But for modern LLM training, it actually doesn't.**
+
+Here is the breakdown of why context matters:
+
+#### 1. Standard Deep Learning (e.g., Computer Vision, small datasets)
+In traditional deep learning, you train a model on a dataset for many epochs (e.g., 100 passes over ImageNet). If you don't shuffle the data and rotate what each GPU sees, the gradients will follow the exact same cyclic pattern every single epoch. The optimizer can get stuck in local minima, and the model might memorize the *sequence* of the batches rather than the underlying features. 
+
+To fix this, standard PyTorch uses a `DistributedSampler`. At the start of every epoch, you call `sampler.set_epoch(epoch)`, which uses the epoch number as a random seed to completely shuffle the dataset and redistribute different chunks to different GPUs.
+
+#### 2. Large Language Model Training (e.g., GPT-2, Llama 3)
+In the context of this script, the model is training on `edu_fineweb10B` (10 billion tokens). Modern LLMs are trained on such unfathomably massive datasets that we typically only ever do **one single epoch** (or sometimes even less than one full pass). 
+
+Because the model will never see the same piece of text twice anyway, shuffling the data across epochs or rotating GPU assignments becomes mathematically irrelevant. The code you provided is intentionally optimized for "streaming" massive amounts of sequential data straight from the disk as fast as possible, skipping the computationally expensive shuffling step entirely!
+
+---
+
